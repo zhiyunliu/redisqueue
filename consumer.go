@@ -1,14 +1,15 @@
 package redisqueue
 
 import (
+	"context"
 	"net"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v7"
 	"github.com/pkg/errors"
+	"github.com/redis/go-redis/v9"
 )
 
 // ConsumerFunc is a type alias for the functions that will be used to handle
@@ -68,7 +69,7 @@ type ConsumerOptions struct {
 	RedisClient redis.UniversalClient
 	// RedisOptions allows you to configure the underlying Redis connection.
 	// More info here:
-	// https://pkg.go.dev/github.com/go-redis/redis/v7?tab=doc#Options.
+	// https://pkg.go.dev/github.com/redis/go-redis/v9?tab=doc#Options.
 	//
 	// This field is used if RedisClient field is nil.
 	RedisOptions *RedisOptions
@@ -210,7 +211,7 @@ func (c *Consumer) Run() {
 
 	for stream, consumer := range c.consumers {
 		//c.streams = append(c.streams, stream)
-		err := c.redis.XGroupCreateMkStream(stream, c.options.GroupName, consumer.id).Err()
+		err := c.redis.XGroupCreateMkStream(context.Background(), stream, c.options.GroupName, consumer.id).Err()
 		// ignoring the BUSYGROUP error makes this a noop
 		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
 			c.Errors <- errors.Wrap(err, "error creating consumer group")
@@ -265,7 +266,7 @@ func (c *Consumer) reclaim() {
 				var end = "+"
 
 				for {
-					res, err := c.redis.XPendingExt(&redis.XPendingExtArgs{
+					res, err := c.redis.XPendingExt(context.Background(), &redis.XPendingExtArgs{
 						Stream: stream,
 						Group:  c.options.GroupName,
 						Start:  start,
@@ -291,7 +292,7 @@ func (c *Consumer) reclaim() {
 
 					for _, r := range res {
 						if r.Idle >= cmgr.visibilityTimeout {
-							claimres, err := c.redis.XClaim(&redis.XClaimArgs{
+							claimres, err := c.redis.XClaim(context.Background(), &redis.XClaimArgs{
 								Stream:   stream,
 								Group:    c.options.GroupName,
 								Consumer: c.options.Name,
@@ -312,7 +313,7 @@ func (c *Consumer) reclaim() {
 							// exists, the only way we can get it out of the
 							// pending state is to acknowledge it.
 							if err == redis.Nil {
-								err = c.redis.XAck(stream, c.options.GroupName, r.ID).Err()
+								err = c.redis.XAck(context.Background(), stream, c.options.GroupName, r.ID).Err()
 								if err != nil {
 									c.Errors <- errors.Wrapf(err, "error acknowledging after failed claim for %q stream and %q message", stream, r.ID)
 									continue
@@ -370,7 +371,7 @@ func (c *Consumer) doReceive(consumer *registeredConsumer) {
 			return
 		default:
 			readArgs.Count = int64(consumer.bufferSize - len(consumer.msgChan))
-			res, err := c.redis.XReadGroup(readArgs).Result()
+			res, err := c.redis.XReadGroup(context.Background(), readArgs).Result()
 			if err != nil {
 				if err, ok := err.(net.Error); ok && err.Timeout() {
 					continue
@@ -420,7 +421,7 @@ func (c *Consumer) work(stream *registeredConsumer) {
 			c.Errors <- errors.Wrapf(err, "error calling ConsumerFunc for %q stream and %q message", msg.Stream, msg.ID)
 			continue
 		}
-		err = c.redis.XAck(msg.Stream, c.options.GroupName, msg.ID).Err()
+		err = c.redis.XAck(context.Background(), msg.Stream, c.options.GroupName, msg.ID).Err()
 		if err != nil {
 			c.Errors <- errors.Wrapf(err, "error acknowledging after success for %q stream and %q message", msg.Stream, msg.ID)
 			continue

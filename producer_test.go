@@ -1,6 +1,7 @@
 package redisqueue
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -55,10 +56,10 @@ func TestEnqueue(t *testing.T) {
 			Stream: tt.Name(),
 			Values: map[string]interface{}{"test": "value"},
 		}
-		err = p.Enqueue(msg)
+		err = p.Enqueue(context.Background(), msg)
 		require.NoError(tt, err)
 
-		res, err := p.redis.XRange(msg.Stream, msg.ID, msg.ID).Result()
+		res, err := p.redis.XRange(context.Background(), msg.Stream, msg.ID, msg.ID).Result()
 		require.NoError(tt, err)
 		assert.Equal(tt, "value", res[0].Values["test"])
 	})
@@ -70,7 +71,7 @@ func TestEnqueue(t *testing.T) {
 		msg := &Message{
 			Stream: tt.Name(),
 		}
-		err = p.Enqueue(msg)
+		err = p.Enqueue(context.Background(), msg)
 		require.Error(tt, err)
 
 		assert.Contains(tt, err.Error(), "wrong number of arguments")

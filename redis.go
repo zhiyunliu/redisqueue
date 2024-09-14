@@ -1,13 +1,14 @@
 package redisqueue
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/go-redis/redis/v7"
 	"github.com/pkg/errors"
+	"github.com/redis/go-redis/v9"
 )
 
 var redisVersionRE = regexp.MustCompile(`redis_version:(.+)`)
@@ -30,7 +31,7 @@ func newRedisClient(options *RedisOptions) *redis.Client {
 // to the actual instance and that the instance supports Redis streams (i.e.
 // it's at least v5).
 func redisPreflightChecks(client redis.UniversalClient) error {
-	info, err := client.Info("server").Result()
+	info, err := client.Info(context.Background(), "server").Result()
 	if err != nil {
 		return err
 	}
