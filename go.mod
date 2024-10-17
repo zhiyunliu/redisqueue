@@ -1,4 +1,4 @@
-module github.com/zhiyunliu/redisqueue/v2
+module github.com/zhiyunliu/redisqueue/v3
 
 go 1.18
 
