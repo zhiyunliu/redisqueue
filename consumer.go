@@ -1,14 +1,15 @@
 package redisqueue
 
 import (
+	"context"
 	"net"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v7"
 	"github.com/pkg/errors"
+	"github.com/redis/go-redis/v9"
 )
 
 // ConsumerFunc is a type alias for the functions that will be used to handle
@@ -16,22 +17,17 @@ import (
 type ConsumerFunc func(*Message) error
 
 type registeredConsumer struct {
-	item        StreamItem
-	fn          ConsumerFunc
-	id          string
-	concurrency int
-	msgChan     chan *Message
+	item              StreamItem
+	fn                ConsumerFunc
+	id                string
+	msgChan           chan *Message
+	visibilityTimeout time.Duration
+	concurrency       int
+	bufferSize        int
 }
 
 func (r registeredConsumer) GetQueue() string {
 	return r.item.GetQueue()
-}
-
-func (r registeredConsumer) GetConcurrency() int {
-	if r.concurrency == 0 {
-		return r.item.GetConcurrency()
-	}
-	return r.concurrency
 }
 
 // ConsumerOptions provide options to configure the Consumer.
@@ -73,7 +69,7 @@ type ConsumerOptions struct {
 	RedisClient redis.UniversalClient
 	// RedisOptions allows you to configure the underlying Redis connection.
 	// More info here:
-	// https://pkg.go.dev/github.com/go-redis/redis/v7?tab=doc#Options.
+	// https://pkg.go.dev/github.com/redis/go-redis/v9?tab=doc#Options.
 	//
 	// This field is used if RedisClient field is nil.
 	RedisOptions *RedisOptions
@@ -91,13 +87,9 @@ type Consumer struct {
 
 	options   *ConsumerOptions
 	redis     redis.UniversalClient
-	consumers map[string]registeredConsumer
-	//streams   []string
-	//queue chan *Message
-	wg *sync.WaitGroup
-
-	stopReclaim chan struct{}
-	stopPoll    chan struct{}
+	consumers map[string]*registeredConsumer
+	wg        *sync.WaitGroup
+	closeChan chan struct{}
 }
 
 var defaultConsumerOptions = &ConsumerOptions{
@@ -153,13 +145,9 @@ func NewConsumerWithOptions(options *ConsumerOptions) (*Consumer, error) {
 
 		options:   options,
 		redis:     r,
-		consumers: make(map[string]registeredConsumer),
-		//streams:   make([]string, 0),
-		//queue: make(chan *Message, options.BufferSize),
-		wg: &sync.WaitGroup{},
-
-		stopReclaim: make(chan struct{}, 1),
-		stopPoll:    make(chan struct{}, 1),
+		consumers: make(map[string]*registeredConsumer),
+		wg:        &sync.WaitGroup{},
+		closeChan: make(chan struct{}),
 	}, nil
 }
 
@@ -179,12 +167,25 @@ func (c *Consumer) RegisterWithLastID(stream StreamItem, id string, fn ConsumerF
 	if concurrency == 0 {
 		concurrency = c.options.Concurrency
 	}
-	c.consumers[stream.GetQueue()] = registeredConsumer{
-		item:        stream,
-		fn:          fn,
-		id:          id,
-		concurrency: concurrency,
-		msgChan:     make(chan *Message, concurrency),
+
+	visibilityTimeout := stream.GetVisibilityTimeout()
+	if visibilityTimeout == 0 {
+		visibilityTimeout = c.options.VisibilityTimeout
+	}
+
+	bufferSize := stream.GetBufferSize()
+	if bufferSize == 0 {
+		bufferSize = c.options.BufferSize
+	}
+
+	c.consumers[stream.GetQueue()] = &registeredConsumer{
+		item:              stream,
+		fn:                fn,
+		id:                id,
+		msgChan:           make(chan *Message, concurrency),
+		concurrency:       concurrency,
+		visibilityTimeout: visibilityTimeout,
+		bufferSize:        bufferSize,
 	}
 }
 
@@ -210,7 +211,7 @@ func (c *Consumer) Run() {
 
 	for stream, consumer := range c.consumers {
 		//c.streams = append(c.streams, stream)
-		err := c.redis.XGroupCreateMkStream(stream, c.options.GroupName, consumer.id).Err()
+		err := c.redis.XGroupCreateMkStream(context.Background(), stream, c.options.GroupName, consumer.id).Err()
 		// ignoring the BUSYGROUP error makes this a noop
 		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
 			c.Errors <- errors.Wrap(err, "error creating consumer group")
@@ -239,10 +240,7 @@ func (c *Consumer) Run() {
 // The order that things stop is 1) the reclaim process (if it's running), 2)
 // the polling process, and 3) the worker processes.
 func (c *Consumer) Shutdown() {
-	c.stopReclaim <- struct{}{}
-	if c.options.VisibilityTimeout == 0 {
-		c.stopPoll <- struct{}{}
-	}
+	close(c.closeChan)
 }
 
 // reclaim runs in a separate goroutine and checks the list of pending messages
@@ -260,22 +258,20 @@ func (c *Consumer) reclaim() {
 
 	for {
 		select {
-		case <-c.stopReclaim:
-			// once the reclaim process has stopped, stop the polling process
-			c.stopPoll <- struct{}{}
+		case <-c.closeChan:
 			return
 		case <-ticker.C:
 			for stream, cmgr := range c.consumers {
-				start := "-"
-				end := "+"
+				var start = "-"
+				var end = "+"
 
 				for {
-					res, err := c.redis.XPendingExt(&redis.XPendingExtArgs{
+					res, err := c.redis.XPendingExt(context.Background(), &redis.XPendingExtArgs{
 						Stream: stream,
 						Group:  c.options.GroupName,
 						Start:  start,
 						End:    end,
-						Count:  int64(c.options.BufferSize - len(cmgr.msgChan)),
+						Count:  int64(cmgr.bufferSize - len(cmgr.msgChan)),
 					}).Result()
 					if err != nil {
 						if strings.HasPrefix(err.Error(), "NOGROUP No such key") {
@@ -295,12 +291,12 @@ func (c *Consumer) reclaim() {
 					msgs := make([]string, 0)
 
 					for _, r := range res {
-						if r.Idle >= c.options.VisibilityTimeout {
-							claimres, err := c.redis.XClaim(&redis.XClaimArgs{
+						if r.Idle >= cmgr.visibilityTimeout {
+							claimres, err := c.redis.XClaim(context.Background(), &redis.XClaimArgs{
 								Stream:   stream,
 								Group:    c.options.GroupName,
 								Consumer: c.options.Name,
-								MinIdle:  c.options.VisibilityTimeout,
+								MinIdle:  cmgr.visibilityTimeout,
 								Messages: []string{r.ID},
 							}).Result()
 							if err != nil && err != redis.Nil {
@@ -317,14 +313,14 @@ func (c *Consumer) reclaim() {
 							// exists, the only way we can get it out of the
 							// pending state is to acknowledge it.
 							if err == redis.Nil {
-								err = c.redis.XAck(stream, c.options.GroupName, r.ID).Err()
+								err = c.redis.XAck(context.Background(), stream, c.options.GroupName, r.ID).Err()
 								if err != nil {
 									c.Errors <- errors.Wrapf(err, "error acknowledging after failed claim for %q stream and %q message", stream, r.ID)
 									continue
 								}
 							}
 							//lcmgr.
-							c.enqueue(&cmgr, claimres, r.RetryCount)
+							c.enqueue(cmgr, claimres, r.RetryCount)
 						}
 					}
 
@@ -346,8 +342,10 @@ func (c *Consumer) reclaim() {
 // of blocking indefinitely so that it can periodically check to see if Shutdown
 // was called.
 func (c *Consumer) poll() {
-	for _, consumer := range c.consumers {
-		go c.doReceive(&consumer) //只有一次循环，不会造成内存重复copy
+	for k := range c.consumers {
+		go func(item *registeredConsumer) {
+			c.doReceive(item) //只有一次循环，不会造成内存重复copy
+		}(c.consumers[k])
 	}
 }
 
@@ -368,11 +366,12 @@ func (c *Consumer) doReceive(consumer *registeredConsumer) {
 
 	for {
 		select {
-		case <-c.stopPoll:
+		case <-c.closeChan:
+			close(consumer.msgChan)
 			return
 		default:
-			readArgs.Count = int64(c.options.BufferSize - len(consumer.msgChan))
-			res, err := c.redis.XReadGroup(readArgs).Result()
+			readArgs.Count = int64(consumer.bufferSize - len(consumer.msgChan))
+			res, err := c.redis.XReadGroup(context.Background(), readArgs).Result()
 			if err != nil {
 				if err, ok := err.(net.Error); ok && err.Timeout() {
 					continue
@@ -416,23 +415,19 @@ func (c *Consumer) enqueue(stream *registeredConsumer, msgs []redis.XMessage, re
 func (c *Consumer) work(stream *registeredConsumer) {
 	defer c.wg.Done()
 
-	for {
-		select {
-		case msg := <-stream.msgChan:
-			err := c.process(msg)
-			if err != nil {
-				c.Errors <- errors.Wrapf(err, "error calling ConsumerFunc for %q stream and %q message", msg.Stream, msg.ID)
-				continue
-			}
-			err = c.redis.XAck(msg.Stream, c.options.GroupName, msg.ID).Err()
-			if err != nil {
-				c.Errors <- errors.Wrapf(err, "error acknowledging after success for %q stream and %q message", msg.Stream, msg.ID)
-				continue
-			}
-		case <-c.stopPoll:
-			return
+	for msg := range stream.msgChan {
+		err := c.process(msg)
+		if err != nil {
+			c.Errors <- errors.Wrapf(err, "error calling ConsumerFunc for %q stream and %q message", msg.Stream, msg.ID)
+			continue
+		}
+		err = c.redis.XAck(context.Background(), msg.Stream, c.options.GroupName, msg.ID).Err()
+		if err != nil {
+			c.Errors <- errors.Wrapf(err, "error acknowledging after success for %q stream and %q message", msg.Stream, msg.ID)
+			continue
 		}
 	}
+
 }
 
 func (c *Consumer) process(msg *Message) (err error) {

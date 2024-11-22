@@ -1,7 +1,9 @@
 package redisqueue
 
 import (
-	"github.com/go-redis/redis/v7"
+	"context"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // ProducerOptions provide options to configure the Producer.
@@ -25,7 +27,7 @@ type ProducerOptions struct {
 	RedisClient redis.UniversalClient
 	// RedisOptions allows you to configure the underlying Redis connection.
 	// More info here:
-	// https://pkg.go.dev/github.com/go-redis/redis/v7?tab=doc#Options.
+	// https://pkg.go.dev/github.com/redis/go-redis/v9?tab=doc#Options.
 	//
 	// This field is used if RedisClient field is nil.
 	RedisOptions *RedisOptions
@@ -74,18 +76,16 @@ func NewProducerWithOptions(options *ProducerOptions) (*Producer, error) {
 // msg.Stream. While you can set msg.ID, unless you know what you're doing, you
 // should let Redis auto-generate the ID. If an ID is auto-generated, it will be
 // set on msg.ID for your reference. msg.Values is also required.
-func (p *Producer) Enqueue(msg *Message) error {
+func (p *Producer) Enqueue(ctx context.Context, msg *Message) error {
 	args := &redis.XAddArgs{
 		ID:     msg.ID,
 		Stream: msg.Stream,
 		Values: msg.Values,
 	}
-	if p.options.ApproximateMaxLength {
-		args.MaxLenApprox = p.options.StreamMaxLength
-	} else {
-		args.MaxLen = p.options.StreamMaxLength
-	}
-	id, err := p.redis.XAdd(args).Result()
+	args.Approx = p.options.ApproximateMaxLength
+	args.MaxLen = p.options.StreamMaxLength
+
+	id, err := p.redis.XAdd(context.Background(), args).Result()
 	if err != nil {
 		return err
 	}
