@@ -2,6 +2,7 @@ package redisqueue
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -17,17 +18,14 @@ import (
 type ConsumerFunc func(*Message) error
 
 type registeredConsumer struct {
-	item              StreamItem
+	stream            string
 	fn                ConsumerFunc
 	id                string
 	msgChan           chan *Message
 	visibilityTimeout time.Duration
 	concurrency       int
 	bufferSize        int
-}
-
-func (r registeredConsumer) GetQueue() string {
-	return r.item.GetQueue()
+	disableRetry      bool
 }
 
 // ConsumerOptions provide options to configure the Consumer.
@@ -179,13 +177,14 @@ func (c *Consumer) RegisterWithLastID(stream StreamItem, id string, fn ConsumerF
 	}
 
 	c.consumers[stream.GetQueue()] = &registeredConsumer{
-		item:              stream,
+		stream:            stream.GetQueue(),
 		fn:                fn,
 		id:                id,
 		msgChan:           make(chan *Message, concurrency),
 		concurrency:       concurrency,
 		visibilityTimeout: visibilityTimeout,
 		bufferSize:        bufferSize,
+		disableRetry:      stream.GetDisableRetry(),
 	}
 }
 
@@ -214,7 +213,7 @@ func (c *Consumer) Run() {
 		err := c.redis.XGroupCreateMkStream(context.Background(), stream, c.options.GroupName, consumer.id).Err()
 		// ignoring the BUSYGROUP error makes this a noop
 		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
-			c.Errors <- errors.Wrap(err, "error creating consumer group")
+			c.Errors <- errors.Wrapf(err, "error creating consumer group. stream[%s],group[%s]", stream, c.options.GroupName)
 			return
 		}
 	}
@@ -255,86 +254,102 @@ func (c *Consumer) reclaim() {
 	}
 
 	ticker := time.NewTicker(c.options.ReclaimInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-c.closeChan:
 			return
 		case <-ticker.C:
-			for stream, cmgr := range c.consumers {
-				var start = "-"
-				var end = "+"
-
-				for {
-					res, err := c.redis.XPendingExt(context.Background(), &redis.XPendingExtArgs{
-						Stream: stream,
-						Group:  c.options.GroupName,
-						Start:  start,
-						End:    end,
-						Count:  int64(cmgr.bufferSize - len(cmgr.msgChan)),
-					}).Result()
-					if err != nil {
-						if strings.HasPrefix(err.Error(), "NOGROUP No such key") {
-							break
-						}
-
-						if err != redis.Nil {
-							c.Errors <- errors.Wrap(err, "error listing pending messages")
-							break
-						}
-					}
-
-					if len(res) == 0 {
-						break
-					}
-
-					msgs := make([]string, 0)
-
-					for _, r := range res {
-						if r.Idle >= cmgr.visibilityTimeout {
-							claimres, err := c.redis.XClaim(context.Background(), &redis.XClaimArgs{
-								Stream:   stream,
-								Group:    c.options.GroupName,
-								Consumer: c.options.Name,
-								MinIdle:  cmgr.visibilityTimeout,
-								Messages: []string{r.ID},
-							}).Result()
-							if err != nil && err != redis.Nil {
-								c.Errors <- errors.Wrapf(err, "error claiming %d message(s)", len(msgs))
-								break
-							}
-							// If the Redis nil error is returned, it means that
-							// the message no longer exists in the stream.
-							// However, it is still in a pending state. This
-							// could happen if a message was claimed by a
-							// consumer, that consumer died, and the message
-							// gets deleted (either through a XDEL call or
-							// through MAXLEN). Since the message no longer
-							// exists, the only way we can get it out of the
-							// pending state is to acknowledge it.
-							if err == redis.Nil {
-								err = c.redis.XAck(context.Background(), stream, c.options.GroupName, r.ID).Err()
-								if err != nil {
-									c.Errors <- errors.Wrapf(err, "error acknowledging after failed claim for %q stream and %q message", stream, r.ID)
-									continue
-								}
-							}
-							//lcmgr.
-							c.enqueue(cmgr, claimres, r.RetryCount)
-						}
-					}
-
-					newID, err := incrementMessageID(res[len(res)-1].ID)
-					if err != nil {
-						c.Errors <- err
-						break
-					}
-
-					start = newID
-				}
+			for _, cmgr := range c.consumers {
+				c.reclaimQueue(cmgr)
 			}
 		}
 	}
+}
+
+func (c *Consumer) reclaimQueue(cmgr *registeredConsumer) {
+
+	//禁用重试
+	if cmgr.disableRetry {
+		return
+	}
+
+	var start = "-"
+	var end = "+"
+
+	for {
+		res, err := c.redis.XPendingExt(context.Background(), &redis.XPendingExtArgs{
+			Stream: cmgr.stream,
+			Group:  c.options.GroupName,
+			Start:  start,
+			End:    end,
+			Idle:   cmgr.visibilityTimeout, //空闲的时长
+			Count:  int64(cmgr.bufferSize - len(cmgr.msgChan)),
+		}).Result()
+		if err != nil {
+			if strings.HasPrefix(err.Error(), "NOGROUP No such key") {
+				break
+			}
+			if err != redis.Nil {
+				c.Errors <- errors.Wrapf(err, "error listing pending messages. stream[%s],group[%s]", cmgr.stream, c.options.GroupName)
+				break
+			}
+		}
+
+		if len(res) == 0 {
+			break
+		}
+
+		msgs := make([]string, 0)
+
+		for _, r := range res {
+			if r.Idle < cmgr.visibilityTimeout {
+				continue
+			}
+
+			claimres, err := c.redis.XClaim(context.Background(), &redis.XClaimArgs{
+				Stream:   cmgr.stream,
+				Group:    c.options.GroupName,
+				Consumer: c.options.Name,
+				MinIdle:  cmgr.visibilityTimeout,
+				Messages: []string{r.ID},
+			}).Result()
+			if err != nil && err != redis.Nil {
+				c.Errors <- errors.Wrapf(err, "error claiming %d message(s)", len(msgs))
+				break
+			}
+			// If the Redis nil error is returned, it means that
+			// the message no longer exists in the stream.
+			// However, it is still in a pending state. This
+			// could happen if a message was claimed by a
+			// consumer, that consumer died, and the message
+			// gets deleted (either through a XDEL call or
+			// through MAXLEN). Since the message no longer
+			// exists, the only way we can get it out of the
+			// pending state is to acknowledge it.
+			if err == redis.Nil {
+				err = c.redis.XAck(context.Background(), cmgr.stream, c.options.GroupName, r.ID).Err()
+				if err != nil {
+					c.Errors <- errors.Wrapf(err, "error acknowledging after failed claim for stream[%q] and message[%q]", cmgr.stream, r.ID)
+					continue
+				}
+			}
+			if len(claimres) > 0 {
+				//lcmgr.
+				c.enqueue(cmgr, claimres, r.RetryCount)
+			}
+		}
+
+		newID, err := incrementMessageID(res[len(res)-1].ID)
+		if err != nil {
+			c.Errors <- err
+			break
+		}
+
+		start = newID
+	}
+
 }
 
 // poll constantly checks the streams using XREADGROUP to see if there are any
@@ -350,7 +365,7 @@ func (c *Consumer) poll() {
 }
 
 func (c *Consumer) doReceive(consumer *registeredConsumer) {
-	streams := []string{consumer.GetQueue(), ">"}
+	streams := []string{consumer.stream, ">"}
 	c.wg.Add(consumer.concurrency)
 	//创建并发线程
 	for i := 0; i < consumer.concurrency; i++ {
@@ -401,7 +416,7 @@ func (c *Consumer) enqueue(stream *registeredConsumer, msgs []redis.XMessage, re
 		stream.msgChan <- &Message{
 			ID:         m.ID,
 			RetryCount: retryCnt,
-			Stream:     stream.GetQueue(),
+			Stream:     stream.stream,
 			Values:     m.Values,
 		}
 	}
@@ -418,12 +433,11 @@ func (c *Consumer) work(stream *registeredConsumer) {
 	for msg := range stream.msgChan {
 		err := c.process(msg)
 		if err != nil {
-			c.Errors <- errors.Wrapf(err, "error calling ConsumerFunc for %q stream and %q message", msg.Stream, msg.ID)
 			continue
 		}
 		err = c.redis.XAck(context.Background(), msg.Stream, c.options.GroupName, msg.ID).Err()
 		if err != nil {
-			c.Errors <- errors.Wrapf(err, "error acknowledging after success for %q stream and %q message", msg.Stream, msg.ID)
+			c.Errors <- errors.Wrapf(err, "error acknowledging after success for stream[%q] and message[%q]", msg.Stream, msg.ID)
 			continue
 		}
 	}
@@ -433,11 +447,8 @@ func (c *Consumer) work(stream *registeredConsumer) {
 func (c *Consumer) process(msg *Message) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			if e, ok := r.(error); ok {
-				err = errors.Wrap(e, "ConsumerFunc panic")
-				return
-			}
-			err = errors.Errorf("ConsumerFunc panic: %v", r)
+			err = fmt.Errorf("Consumer.process panic. stream[%s],message[%s],value:%+v error:%v", msg.Stream, msg.ID, msg.Values, r)
+			c.Errors <- err
 		}
 	}()
 	err = c.consumers[msg.Stream].fn(msg)
