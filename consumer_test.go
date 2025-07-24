@@ -31,6 +31,10 @@ func (s testStream) GetBufferSize() int {
 	return 0
 }
 
+func (s testStream) GetDisableRetry() bool {
+	return false
+}
+
 func TestNewConsumer(t *testing.T) {
 	t.Run("creates a new consumer", func(tt *testing.T) {
 		c, err := NewConsumer()
