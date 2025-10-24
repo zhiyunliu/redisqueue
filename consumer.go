@@ -165,8 +165,7 @@ func (c *Consumer) RegisterWithLastID(stream StreamItem, id string, fn ConsumerF
 	if concurrency == 0 {
 		concurrency = c.options.Concurrency
 	}
-
-	visibilityTimeout := stream.GetVisibilityTimeout()
+	visibilityTimeout := time.Duration(stream.GetVisibilityTimeout()) * time.Second
 	if visibilityTimeout == 0 {
 		visibilityTimeout = c.options.VisibilityTimeout
 	}
@@ -193,7 +192,7 @@ func (c *Consumer) RegisterWithLastID(stream StreamItem, id string, fn ConsumerF
 // before Run is called. If the same stream name is passed in twice, the first
 // ConsumerFunc is overwritten by the second.
 func (c *Consumer) Register(stream StreamItem, fn ConsumerFunc) {
-	c.RegisterWithLastID(stream, "0", fn)
+	c.RegisterWithLastID(stream, "", fn)
 }
 
 // Run starts all of the worker goroutines and starts processing from the

@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var _ StreamItem = testStream("test")
+
 type testStream string
 
 func (s testStream) GetQueue() string {
@@ -23,7 +25,7 @@ func (s testStream) GetConcurrency() int {
 	return 0
 }
 
-func (s testStream) GetVisibilityTimeout() time.Duration {
+func (s testStream) GetVisibilityTimeout() int {
 	return 0
 }
 
