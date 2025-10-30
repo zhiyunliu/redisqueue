@@ -277,21 +277,28 @@ func (c *Consumer) reclaimQueue(cmgr *registeredConsumer) {
 	var start = "-"
 	var end = "+"
 
+	pendingIdle := time.Duration(0)
+	if EnableXPendingExtIdele {
+		pendingIdle = cmgr.visibilityTimeout
+	}
+
 	for {
-		res, err := c.redis.XPendingExt(context.Background(), &redis.XPendingExtArgs{
+		args := XPendingExtArgs{
 			Stream: cmgr.stream,
 			Group:  c.options.GroupName,
 			Start:  start,
 			End:    end,
-			Idle:   cmgr.visibilityTimeout, //空闲的时长
+			Idle:   pendingIdle, //空闲的时长
 			Count:  int64(cmgr.bufferSize - len(cmgr.msgChan)),
-		}).Result()
+		}
+		redisArgs := redis.XPendingExtArgs(args)
+		res, err := c.redis.XPendingExt(context.Background(), &redisArgs).Result()
 		if err != nil {
 			if strings.HasPrefix(err.Error(), "NOGROUP No such key") {
 				break
 			}
 			if err != redis.Nil {
-				c.Errors <- errors.Wrapf(err, "error listing pending messages. stream[%s],group[%s]", cmgr.stream, c.options.GroupName)
+				c.Errors <- errors.Wrapf(err, "error listing pending messages. args[%s]", args)
 				break
 			}
 		}
@@ -307,13 +314,16 @@ func (c *Consumer) reclaimQueue(cmgr *registeredConsumer) {
 				continue
 			}
 
-			claimres, err := c.redis.XClaim(context.Background(), &redis.XClaimArgs{
+			args := XClaimArgs{
 				Stream:   cmgr.stream,
 				Group:    c.options.GroupName,
 				Consumer: c.options.Name,
 				MinIdle:  cmgr.visibilityTimeout,
 				Messages: []string{r.ID},
-			}).Result()
+			}
+			redisArgs := redis.XClaimArgs(args)
+
+			claimres, err := c.redis.XClaim(context.Background(), &redisArgs).Result()
 			if err != nil && err != redis.Nil {
 				c.Errors <- errors.Wrapf(err, "error claiming %d message(s)", len(msgs))
 				break
@@ -330,7 +340,7 @@ func (c *Consumer) reclaimQueue(cmgr *registeredConsumer) {
 			if err == redis.Nil {
 				err = c.redis.XAck(context.Background(), cmgr.stream, c.options.GroupName, r.ID).Err()
 				if err != nil {
-					c.Errors <- errors.Wrapf(err, "error acknowledging after failed claim for stream[%q] and message[%q]", cmgr.stream, r.ID)
+					c.Errors <- errors.Wrapf(err, "error acknowledging after failed claim. args[%s]", args)
 					continue
 				}
 			}
@@ -397,7 +407,7 @@ func (c *Consumer) doReceive(consumer *registeredConsumer) {
 					time.Sleep(c.options.BlockingTimeout)
 					continue
 				}
-				c.Errors <- errors.Wrap(err, "error reading redis stream:")
+				c.Errors <- errors.Wrap(err, fmt.Sprintf("error reading redis stream:args[%s]", XReadGroupArgs(*readArgs)))
 				continue
 			}
 
