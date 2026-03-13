@@ -81,13 +81,14 @@ type Consumer struct {
 	// have a listener on it. If you don't parts of the consumer could stop
 	// functioning when errors occur due to the blocking nature of unbuffered
 	// channels.
-	Errors chan error
-
+	Errors    chan error
 	options   *ConsumerOptions
 	redis     redis.UniversalClient
 	consumers map[string]*registeredConsumer
 	wg        *sync.WaitGroup
 	closeChan chan struct{}
+	// enableXPendingExtIdele enable XPENDING EXTIDLE(支持redis 6.2.0以上版本)
+	enableXPendingExtIdele bool
 }
 
 var defaultConsumerOptions = &ConsumerOptions{
@@ -138,14 +139,19 @@ func NewConsumerWithOptions(options *ConsumerOptions) (*Consumer, error) {
 		return nil, err
 	}
 
-	return &Consumer{
-		Errors: make(chan error),
+	enable, err := checkXPendingEnable(r)
+	if err != nil {
+		return nil, err
+	}
 
-		options:   options,
-		redis:     r,
-		consumers: make(map[string]*registeredConsumer),
-		wg:        &sync.WaitGroup{},
-		closeChan: make(chan struct{}),
+	return &Consumer{
+		Errors:                 make(chan error),
+		options:                options,
+		redis:                  r,
+		consumers:              make(map[string]*registeredConsumer),
+		wg:                     &sync.WaitGroup{},
+		closeChan:              make(chan struct{}),
+		enableXPendingExtIdele: enable,
 	}, nil
 }
 
@@ -278,7 +284,7 @@ func (c *Consumer) reclaimQueue(cmgr *registeredConsumer) {
 	var end = "+"
 
 	pendingIdle := time.Duration(0)
-	if EnableXPendingExtIdele {
+	if c.enableXPendingExtIdele {
 		pendingIdle = cmgr.visibilityTimeout
 	}
 

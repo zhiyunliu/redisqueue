@@ -3,6 +3,7 @@ module github.com/zhiyunliu/redisqueue/v3
 go 1.18
 
 require (
+	github.com/hashicorp/go-version v1.8.0
 	github.com/pkg/errors v0.9.1
 	github.com/redis/go-redis/v9 v9.6.1
 	github.com/stretchr/testify v1.9.0
