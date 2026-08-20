@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/panjf2000/ants/v2"
 	"github.com/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
@@ -21,11 +22,41 @@ type registeredConsumer struct {
 	stream            string
 	fn                ConsumerFunc
 	id                string
-	msgChan           chan *Message
 	visibilityTimeout time.Duration
 	concurrency       int
 	bufferSize        int
 	disableRetry      bool
+
+	consumer *Consumer
+	// runnerPool 消息处理协程池,容量为 concurrency
+	runnerPool    *ants.PoolWithFunc
+	closePoolLock *sync.Once
+}
+
+// run 协程池的消息处理函数
+func (item *registeredConsumer) run(arg interface{}) {
+	msg, ok := arg.(*Message)
+	if !ok {
+		return
+	}
+	item.consumer.work(item, msg)
+}
+
+// releasePool 关闭协程池,等待正在处理中的消息处理完成
+func (item *registeredConsumer) releasePool() {
+	item.closePoolLock.Do(func() {
+		_ = item.runnerPool.ReleaseTimeout(PoolReleaseTimeout)
+	})
+}
+
+// freeCount 本次最多可以拉取的消息数量。协程池占满时至少拉取 1 条,拉取后会在
+// 提交协程池时阻塞等待空闲协程,以此形成背压。
+func (item *registeredConsumer) freeCount() int64 {
+	cnt := item.bufferSize - item.runnerPool.Running()
+	if cnt < 1 {
+		cnt = 1
+	}
+	return int64(cnt)
 }
 
 // ConsumerOptions provide options to configure the Consumer.
@@ -55,11 +86,11 @@ type ConsumerOptions struct {
 	// will allow messages to be reaped faster, but it will put more load on
 	// Redis.
 	ReclaimInterval time.Duration
-	// BufferSize determines the size of the channel uses to coordinate the
-	// processing of the messages. This determines the maximum number of
-	// in-flight messages.
+	// BufferSize determines how many messages are fetched from Redis at a
+	// time. This determines the maximum number of in-flight messages.
 	BufferSize int
-	// Concurrency dictates how many goroutines to spawn to handle the messages.
+	// Concurrency dictates the size of the goroutine pool that handles the
+	// messages, i.e. how many messages are processed at the same time.
 	Concurrency int
 	// RedisClient supersedes the RedisOptions field, and allows you to inject
 	// an already-made Redis Client for use in the consumer. This may be either
@@ -87,6 +118,7 @@ type Consumer struct {
 	consumers map[string]*registeredConsumer
 	wg        *sync.WaitGroup
 	closeChan chan struct{}
+	closeOnce *sync.Once
 	// enableXPendingExtIdele enable XPENDING EXTIDLE(支持redis 6.2.0以上版本)
 	enableXPendingExtIdele bool
 }
@@ -151,6 +183,7 @@ func NewConsumerWithOptions(options *ConsumerOptions) (*Consumer, error) {
 		consumers:              make(map[string]*registeredConsumer),
 		wg:                     &sync.WaitGroup{},
 		closeChan:              make(chan struct{}),
+		closeOnce:              &sync.Once{},
 		enableXPendingExtIdele: enable,
 	}, nil
 }
@@ -168,7 +201,7 @@ func (c *Consumer) RegisterWithLastID(stream StreamItem, id string, fn ConsumerF
 	}
 
 	concurrency := stream.GetConcurrency()
-	if concurrency == 0 {
+	if concurrency <= 0 {
 		concurrency = c.options.Concurrency
 	}
 	visibilityTimeout := time.Duration(stream.GetVisibilityTimeout()) * time.Second
@@ -185,11 +218,12 @@ func (c *Consumer) RegisterWithLastID(stream StreamItem, id string, fn ConsumerF
 		stream:            stream.GetQueue(),
 		fn:                fn,
 		id:                id,
-		msgChan:           make(chan *Message, concurrency),
 		concurrency:       concurrency,
 		visibilityTimeout: visibilityTimeout,
 		bufferSize:        bufferSize,
 		disableRetry:      stream.GetDisableRetry(),
+		consumer:          c,
+		closePoolLock:     &sync.Once{},
 	}
 }
 
@@ -218,7 +252,16 @@ func (c *Consumer) Run() {
 		err := c.redis.XGroupCreateMkStream(context.Background(), stream, c.options.GroupName, consumer.id).Err()
 		// ignoring the BUSYGROUP error makes this a noop
 		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+			c.releasePools()
 			c.Errors <- errors.Wrapf(err, "error creating consumer group. stream[%s],group[%s]", stream, c.options.GroupName)
+			return
+		}
+
+		//创建消息处理协程池,取代之前每个 stream 固定 concurrency 个常驻 goroutine 的方式
+		consumer.runnerPool, err = ants.NewPoolWithFunc(consumer.concurrency, consumer.run)
+		if err != nil {
+			c.releasePools()
+			c.Errors <- errors.Wrapf(err, "error creating goroutine pool. stream[%s],concurrency[%d]", stream, consumer.concurrency)
 			return
 		}
 	}
@@ -228,7 +271,7 @@ func (c *Consumer) Run() {
 	// }
 
 	go c.reclaim()
-	go c.poll()
+	c.poll()
 
 	stop := newSignalHandler()
 	go func() {
@@ -242,9 +285,23 @@ func (c *Consumer) Run() {
 // Shutdown stops new messages from being processed and tells the workers to
 // wait until all in-flight messages have been processed, and then they exit.
 // The order that things stop is 1) the reclaim process (if it's running), 2)
-// the polling process, and 3) the worker processes.
+// the polling process, and 3) the goroutine pools. It is safe to call Shutdown
+// more than once.
 func (c *Consumer) Shutdown() {
-	close(c.closeChan)
+	c.closeOnce.Do(func() {
+		close(c.closeChan)
+	})
+}
+
+// releasePools closes every registered goroutine pool, waiting up to
+// PoolReleaseTimeout for the in-flight messages of each one to finish.
+func (c *Consumer) releasePools() {
+	for _, consumer := range c.consumers {
+		if consumer.runnerPool == nil {
+			continue
+		}
+		consumer.releasePool()
+	}
 }
 
 // reclaim runs in a separate goroutine and checks the list of pending messages
@@ -295,7 +352,7 @@ func (c *Consumer) reclaimQueue(cmgr *registeredConsumer) {
 			Start:  start,
 			End:    end,
 			Idle:   pendingIdle, //空闲的时长
-			Count:  int64(cmgr.bufferSize - len(cmgr.msgChan)),
+			Count:  cmgr.freeCount(),
 		}
 		redisArgs := redis.XPendingExtArgs(args)
 		res, err := c.redis.XPendingExt(context.Background(), &redisArgs).Result()
@@ -373,6 +430,7 @@ func (c *Consumer) reclaimQueue(cmgr *registeredConsumer) {
 // was called.
 func (c *Consumer) poll() {
 	for k := range c.consumers {
+		c.wg.Add(1)
 		go func(item *registeredConsumer) {
 			c.doReceive(item) //只有一次循环，不会造成内存重复copy
 		}(c.consumers[k])
@@ -380,12 +438,13 @@ func (c *Consumer) poll() {
 }
 
 func (c *Consumer) doReceive(consumer *registeredConsumer) {
+	defer func() {
+		//等待协程池中正在处理的消息处理完成
+		consumer.releasePool()
+		c.wg.Done()
+	}()
+
 	streams := []string{consumer.stream, ">"}
-	c.wg.Add(consumer.concurrency)
-	//创建并发线程
-	for i := 0; i < consumer.concurrency; i++ {
-		go c.work(consumer)
-	}
 
 	readArgs := &redis.XReadGroupArgs{
 		Group:    c.options.GroupName,
@@ -397,10 +456,9 @@ func (c *Consumer) doReceive(consumer *registeredConsumer) {
 	for {
 		select {
 		case <-c.closeChan:
-			close(consumer.msgChan)
 			return
 		default:
-			readArgs.Count = int64(consumer.bufferSize - len(consumer.msgChan))
+			readArgs.Count = consumer.freeCount()
 			res, err := c.redis.XReadGroup(context.Background(), readArgs).Result()
 			if err != nil {
 				if err, ok := err.(net.Error); ok && err.Timeout() {
@@ -424,48 +482,50 @@ func (c *Consumer) doReceive(consumer *registeredConsumer) {
 	}
 }
 
-// enqueue takes a slice of XMessages, creates corresponding Messages, and sends
-// them on the centralized channel for worker goroutines to process.
+// enqueue takes a slice of XMessages, creates corresponding Messages, and
+// submits them to the stream's goroutine pool. Invoke blocks while the pool is
+// saturated, which provides the same back pressure the buffered channel used to.
 func (c *Consumer) enqueue(stream *registeredConsumer, msgs []redis.XMessage, retryCnt int64) {
 	for _, m := range msgs {
-		stream.msgChan <- &Message{
+		err := stream.runnerPool.Invoke(&Message{
 			ID:         m.ID,
 			RetryCount: retryCnt,
 			Stream:     stream.stream,
 			Values:     m.Values,
+		})
+		if err == nil {
+			continue
 		}
+		//协程池已关闭,消息没有被ACK,重启后会由 reclaim 重新投递
+		if err == ants.ErrPoolClosed || err == ants.ErrPoolOverload {
+			return
+		}
+		c.Errors <- errors.Wrapf(err, "error dispatching to the pool for stream[%q] and message[%q]", stream.stream, m.ID)
 	}
 }
 
-// work is called in a separate goroutine. The number of work goroutines is
-// determined by Concurreny. Once it gets a message from the centralized
-// channel, it calls the corrensponding ConsumerFunc depending on the stream it
-// came from. If no error is returned from the ConsumerFunc, the message is
-// acknowledged in Redis.
-func (c *Consumer) work(stream *registeredConsumer) {
-	defer c.wg.Done()
-
-	for msg := range stream.msgChan {
-		err := c.process(msg)
-		if err != nil {
-			continue
-		}
-		err = c.redis.XAck(context.Background(), msg.Stream, c.options.GroupName, msg.ID).Err()
-		if err != nil {
-			c.Errors <- errors.Wrapf(err, "error acknowledging after success for stream[%q] and message[%q]", msg.Stream, msg.ID)
-			continue
-		}
+// work is called by the stream's goroutine pool. The number of messages handled
+// at the same time is determined by Concurrency. It calls the corrensponding
+// ConsumerFunc depending on the stream the message came from. If no error is
+// returned from the ConsumerFunc, the message is acknowledged in Redis.
+func (c *Consumer) work(stream *registeredConsumer, msg *Message) {
+	err := c.process(stream, msg)
+	if err != nil {
+		return
 	}
-
+	err = c.redis.XAck(context.Background(), msg.Stream, c.options.GroupName, msg.ID).Err()
+	if err != nil {
+		c.Errors <- errors.Wrapf(err, "error acknowledging after success for stream[%q] and message[%q]", msg.Stream, msg.ID)
+	}
 }
 
-func (c *Consumer) process(msg *Message) (err error) {
+func (c *Consumer) process(stream *registeredConsumer, msg *Message) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("Consumer.process panic. stream[%s],message[%s],value:%+v error:%v", msg.Stream, msg.ID, msg.Values, r)
 			c.Errors <- err
 		}
 	}()
-	err = c.consumers[msg.Stream].fn(msg)
+	err = stream.fn(msg)
 	return
 }
